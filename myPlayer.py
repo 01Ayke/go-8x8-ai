@@ -1,19 +1,3 @@
-# -*- coding: utf-8 -*-
-"""Tournament player for 8x8 Go (Tromp-Taylor rules).
-
-Search:
-- Iterative deepening + PVS (Principal Variation Search / NegaScout)
-- Transposition table with EXACT / LOWER / UPPER bounds
-- Aspiration windows (narrows alpha-beta window using previous iteration result)
-- Killer moves (2 per depth) + history heuristic for move ordering
-- Adaptive max depth: deeper search when few empty cells remain
-
-Evaluation:
-- Group-level liberty analysis via union-find (_stringLiberties / _stringSizes)
-- Atari detection: heavy penalty/bonus for groups with 1 or 2 liberties
-- Eye counting: structural safety bonus
-- Territory score (compute_score), captures, influence, centre
-"""
 
 import math
 import time
@@ -21,10 +5,10 @@ import time
 import Goban
 from playerInterface import *
 
-
-_TT_EXACT = 0
-_TT_LOWER = 1
-_TT_UPPER = 2
+# Constantes pour la table de transposition : indique le type de borne stockée
+_TT_EXACT = 0   # valeur exacte
+_TT_LOWER = 1   # borne inférieure 
+_TT_UPPER = 2   # borne supérieure 
 
 
 class _TimeOut(Exception):
@@ -37,34 +21,32 @@ class myPlayer(PlayerInterface):
         self._mycolor = None
         self._opponent = None
 
-        self._ttable = {}
-        self._total_budget = 45.0 * 60.0
-        self._used_time = 0.0
-        self._safety_margin = 2.0
+        self._ttable = {}  # mémorise les positions déja evaluées pour éviter de les recalculer
+        self._total_budget = 45.0 * 60.0  # 45 min pour la partie
+        self._used_time = 0.0  # temps consomme depuis le début
+        self._safety_margin = 2.0  # marge de sécurité en secondes à ne pas dépasser
 
-        self._max_depth = 6
-        self._max_candidates = 18
+        self._max_depth = 10  # profondeur max de recherche en phase normale
+        self._max_candidates = 24  # nombre maximum de coups candidats explorés à chaque noeud
         self._root_move = -1
         self._deadline = 0.0
 
-        # killer_moves[depth] = [best_killer, second_killer]
+        # pour chaque profondeur, on mémorise les 2 coups qui ont causé le plus de coupures beta
         self._killer_moves = {}
-        # history[move] = accumulated cutoff score
+        # historique : score cumulé par coup, pour favoriser ceux qui coupent souvent l'arbre
         self._history = {}
 
     def getPlayerName(self):
         return "Kechna/Shrestha"
 
-    # ------------------------------------------------------------------
-    # Board helpers
-    # ------------------------------------------------------------------
-
+    # Génère les coordonnées  des cases voisines d'une case donnée
     def _neighbors(self, flat_coord):
         i = self._board._neighborsEntries[flat_coord]
         while self._board._neighbors[i] != -1:
             yield int(self._board._neighbors[i])
             i += 1
 
+    # Retourne True si au moins une case adjacente au coup est occupée
     def _has_neighbor_stone(self, move):
         b = self._board.get_board()
         for n in self._neighbors(move):
@@ -72,12 +54,8 @@ class myPlayer(PlayerInterface):
                 return True
         return False
 
-    # ------------------------------------------------------------------
-    # Move ordering
-    # ------------------------------------------------------------------
-
+    # Score heuristique d'un coup pour l'ordonner avant la recherche
     def _quick_order_score(self, move, color):
-        """Heuristic score for a candidate move (higher = explore first)."""
         if move == -1:
             return -1000.0
 
@@ -94,28 +72,29 @@ class myPlayer(PlayerInterface):
                 libs = self._board._stringLiberties[root]
                 if stone == opponent:
                     if libs == 1:
-                        score += 12.0  # capture opponent group
+                        score += 12.0  # le groupe adverse est en atari : ce coup le capture alors très prioritaire
                     elif libs == 2:
-                        score += 6.0  # put opponent in atari
+                        score += 6.0   # le groupe adverse a 2 libertés : ce coup le met en atari alors prioritaire
                     else:
                         score += 3.0
-                else:  # same color
+                else:
                     if libs == 1:
-                        score += 8.0  # save own group from capture
+                        score += 8.0   # notre propre groupe est en atari : ce coup le sauve alors très prioritaire
                     elif libs == 2:
-                        score += 2.5  # shore up nearly-threatened group
+                        score += 2.5   # notre groupe a 2 libertés : on le renforce
                     else:
                         score += 2.0
 
         x, y = Goban.Board.unflatten(move)
+        # pénalité pour les coups loin du centre : on préfère jouer au centre en général
         score -= 0.4 * (abs(x - 3.5) + abs(y - 3.5))
         return score
 
+    # Retourne la liste des coups triés du meilleur au moins bon pour maximiser les coupures alpha-beta
     def _ordered_moves(self, color, depth=0):
         moves = self._board.weak_legal_moves()
         non_pass = [m for m in moves if m != -1]
 
-        # Opening: prefer strong corner / near-centre points
         if self._board._nbBLACK + self._board._nbWHITE == 0:
             opening = [
                 Goban.Board.flatten((3, 3)),
@@ -133,7 +112,6 @@ class myPlayer(PlayerInterface):
             ordered.append(-1)
             return ordered
 
-        # Killer moves bump to front
         killers = self._killer_moves.get(depth, [None, None])
         non_pass_set = set(non_pass)
         killer_set = {k for k in killers if k is not None and k in non_pass_set}
@@ -157,23 +135,9 @@ class myPlayer(PlayerInterface):
         frontier.append(-1)
         return frontier
 
-    # ------------------------------------------------------------------
-    # Evaluation
-    # ------------------------------------------------------------------
+
 
     def _evaluate(self):
-        """
-        Sophisticated position evaluation.
-
-        Combines:
-        - Territory score (Chinese area scoring via compute_score)
-        - Captures
-        - Group-level liberty analysis (uses _stringLiberties / _stringSizes)
-        - Atari: heavy weight on groups with 1 liberty (in danger)
-        - Near-atari: moderate weight on groups with 2 liberties
-        - Eye count (structural safety)
-        - Influence and centre control
-        """
         if self._board.is_game_over():
             winner = self._board.result_number()
             if winner == self._mycolor:
@@ -182,6 +146,7 @@ class myPlayer(PlayerInterface):
                 return -10_000.0
             return 0.0
 
+        # calcul du score Go réel  : pierres sur le plateau + territoire entouré
         score_b, score_w = self._board.compute_score()
         if self._mycolor == Goban.Board._BLACK:
             score_term = float(score_b - score_w)
@@ -196,14 +161,15 @@ class myPlayer(PlayerInterface):
 
         board = self._board.get_board()
 
-        # --- Group-level analysis (one pass per group via union-find) ---
+        # analyse par groupe  grâce à la structure union-find de Goban :
+        # chaque groupe est identifié par sa racine, qui stocke le nombre total de libertés et la taille
         analyzed_groups = set()
         lib_my = 0.0
         lib_opp = 0.0
-        atari_my = 0.0  # weighted size of MY groups in atari/near-atari
-        atari_opp = 0.0  # weighted size of OPPONENT groups in atari/near-atari
+        atari_my = 0.0   
+        atari_opp = 0.0  
 
-        # --- Stone-level analysis ---
+        # variables pour l'analyse pierre par pierre 
         infl_my = 0.0
         infl_opp = 0.0
         center_my = 0.0
@@ -214,7 +180,7 @@ class myPlayer(PlayerInterface):
             if p == Goban.Board._EMPTY:
                 continue
 
-            # Stone-level: influence and centre
+            # pour chaque pierre : calcul de son influence locale 
             influence = 0.0
             for n in self._neighbors(fc):
                 if board[n] == Goban.Board._EMPTY:
@@ -232,7 +198,6 @@ class myPlayer(PlayerInterface):
                 infl_opp += influence
                 center_opp += center_bonus
 
-            # Group-level: only process each group root once
             root = self._board._getStringOfStone(fc)
             if root in analyzed_groups:
                 continue
@@ -244,17 +209,17 @@ class myPlayer(PlayerInterface):
             if p == self._mycolor:
                 lib_my += libs
                 if libs == 1:
-                    atari_my += size  # in atari: full penalty
+                    atari_my += size          # atari : notre groupe n'a plus qu'1 liberté donc grosse pénalité
                 elif libs == 2:
-                    atari_my += size * 0.35  # near-atari: soft penalty
+                    atari_my += size * 0.35   # quasi-atari : 2 libertés donc pénalité plus faible
             else:
                 lib_opp += libs
                 if libs == 1:
-                    atari_opp += size  # opponent in atari: full reward
+                    atari_opp += size         # atari adverse : le groupe ennemi est en danger donc gros bonus
                 elif libs == 2:
-                    atari_opp += size * 0.35  # opponent near-atari: soft reward
+                    atari_opp += size * 0.35  # quasi-atari adverse donc bonus plus faible
 
-        # --- Eye counting ---
+        # comptage des yeux : une case vide entourée uniquement de nos pierres est un oeil
         eyes_my = 0.0
         eyes_opp = 0.0
         for fc in range(len(board)):
@@ -265,31 +230,33 @@ class myPlayer(PlayerInterface):
                     eyes_opp += 1.0
 
         liberties_term = lib_my - lib_opp
-        atari_term = atari_opp - atari_my  # positive = good for us
+        atari_term = atari_opp - atari_my  # positif = bon pour nous
         influence_term = infl_my - infl_opp
         center_term = center_my - center_opp
         eye_term = eyes_my - eyes_opp
 
+        # score final pondéré : le territoire et l'atari ont les poids les plus forts
         return (
-            2.0 * score_term
-            + 1.2 * captures_term
+            2.0  * score_term
+            + 1.2  * captures_term
             + 0.35 * liberties_term
-            + 3.5 * atari_term
-            + 0.2 * influence_term
+            + 3.5  * atari_term
+            + 0.2  * influence_term
             + 0.15 * center_term
-            + 1.5 * eye_term
+            + 1.5  * eye_term
         )
 
-    # ------------------------------------------------------------------
-    # Search
-    # ------------------------------------------------------------------
 
+
+    # Lève une exception si le temps alloué pour ce coup est écoulé
     def _check_time(self):
         if time.perf_counter() >= self._deadline:
             raise _TimeOut()
 
     def _negamax(self, depth, alpha, beta):
-        """PVS (Principal Variation Search) with transposition table."""
+        # Algorithme PVS (Principal Variation Search) : variante optimisée de l'alpha-beta.
+        # Le premier coup est cherché avec une fenêtre pleine, les suivants avec une fenêtre nulle
+        # (moins coûteuse), puis re-cherchés seulement si nécessaire.
         self._check_time()
 
         player_to_move = self._board.next_player()
@@ -298,7 +265,8 @@ class myPlayer(PlayerInterface):
         if depth == 0 or self._board.is_game_over():
             return sign * self._evaluate()
 
-        # --- Transposition table lookup ---
+        # consultation de la table de transposition : si cette position a déjà été calculée
+        # à cette profondeur, on réutilise le résultat pour éviter de refaire le calcul
         key = (int(self._board._currentHash), depth, player_to_move)
         cached = self._ttable.get(key)
         if cached is not None:
@@ -326,11 +294,11 @@ class myPlayer(PlayerInterface):
 
             try:
                 if first_move:
-                    # Full window on first (expected best) move
+                    # premier coup : fenêtre complète [alpha, beta] car c'est le candidat supposé meilleur
                     value = -self._negamax(depth - 1, -beta, -alpha)
                     first_move = False
                 else:
-                    # PVS: null-window search, re-search only if it might be better
+                    # si le résultat dépasse alpha, on refait une recherche complète pour confirmer
                     value = -self._negamax(depth - 1, -alpha - 1, -alpha)
                     if alpha < value < beta:
                         value = -self._negamax(depth - 1, -beta, -alpha)
@@ -342,7 +310,7 @@ class myPlayer(PlayerInterface):
             if value > alpha:
                 alpha = value
             if alpha >= beta:
-                # Beta cutoff — update killers and history
+                # on mémorise ce coup comme killer move et on incrémente son score dans l'historique.
                 if move != -1:
                     killers = self._killer_moves.setdefault(depth, [None, None])
                     if killers[0] != move:
@@ -354,7 +322,7 @@ class myPlayer(PlayerInterface):
         if not has_valid:
             best = sign * self._evaluate()
 
-        # --- Store in transposition table ---
+        # UPPER si on n'a pas amélioré alpha, LOWER si coupure beta, EXACT sinon
         if best <= orig_alpha:
             tt_flag = _TT_UPPER
         elif best >= beta:
@@ -366,7 +334,7 @@ class myPlayer(PlayerInterface):
         return best
 
     def _search_root(self, depth, alpha=-math.inf, beta=math.inf):
-        """Root search with PVS. Returns (best_move, best_value)."""
+        # recherche à la racine de l'arbre : même logique que _negamax mais on garde aussi le coup choisi
         color = self._board.next_player()
         best_val = -math.inf
         best_move = self._root_move
@@ -398,9 +366,7 @@ class myPlayer(PlayerInterface):
 
         return best_move, best_val
 
-    # ------------------------------------------------------------------
-    # Time management
-    # ------------------------------------------------------------------
+
 
     def _allocate_turn_budget(self):
         remaining = self._total_budget - self._used_time - self._safety_margin
@@ -410,6 +376,7 @@ class myPlayer(PlayerInterface):
         empties = len(self._board._empties)
         estimated_own_turns_left = max(6, empties // 2)
         base = remaining / estimated_own_turns_left
+
 
         if empties > 42:
             factor = 0.9
@@ -421,9 +388,6 @@ class myPlayer(PlayerInterface):
         budget = base * factor
         return max(0.05, min(10.0, budget, 0.25 * remaining))
 
-    # ------------------------------------------------------------------
-    # PlayerInterface implementation
-    # ------------------------------------------------------------------
 
     def getPlayerMove(self):
         t0 = time.perf_counter()
@@ -437,7 +401,7 @@ class myPlayer(PlayerInterface):
                 self._board.push(only)
                 return Goban.Board.flat_to_name(only)
 
-            # Default fallback in case search is interrupted immediately
+            # coup par défaut de secours : si le temps est coupé avant la fin de la profondeur 1
             self._root_move = next((m for m in legal if m != -1), legal[0])
 
             self._ttable.clear()
@@ -447,7 +411,7 @@ class myPlayer(PlayerInterface):
             turn_budget = self._allocate_turn_budget()
             self._deadline = time.perf_counter() + turn_budget
 
-            # Deeper endgame search when branching factor is small
+            # en fin de partie, le nombre de coups possibles chute → on peut chercher beaucoup plus profond
             empties = len(self._board._empties)
             if empties <= 8:
                 max_d = 12
@@ -463,12 +427,11 @@ class myPlayer(PlayerInterface):
             for depth in range(1, max_d + 1):
                 try:
                     if reached_depth >= 2 and abs(best_val) < 9_000.0:
-                        # Aspiration window: narrow search around previous result
+
                         window = 1.5
                         lo, hi = best_val - window, best_val + window
                         candidate, value = self._search_root(depth, lo, hi)
                         if value <= lo or value >= hi:
-                            # Window failed — full re-search at this depth
                             candidate, value = self._search_root(depth)
                     else:
                         candidate, value = self._search_root(depth)
@@ -480,7 +443,7 @@ class myPlayer(PlayerInterface):
                     best_val = value
                     reached_depth = depth
 
-                # Stop early if we found a forced win/loss
+                # si on a trouvé une victoire ou défaite forcée, inutile de chercher plus profond
                 if abs(best_val) >= 9_000.0:
                     break
 
@@ -496,9 +459,11 @@ class myPlayer(PlayerInterface):
         finally:
             self._used_time += time.perf_counter() - t0
 
+    # l'arbitre nous informe du coup joué par l'adversaire : on le joue sur notre plateau interne
     def playOpponentMove(self, move):
         self._board.push(Goban.Board.name_to_flat(move))
 
+    # nouvelle partie : on remet le plateau et toutes les structures de recherche à zéro
     def newGame(self, color):
         self._board = Goban.Board()
         self._mycolor = color
