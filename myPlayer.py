@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-MCTS player using the 6-channel CNN from proj1 as value heuristic.
-Model outputs P(black wins); perspective is corrected per player.
+MCTS player using the 6-channel CNN from last tp as value heuristic.
 """
 
 import math
@@ -19,7 +18,7 @@ import torch.nn.functional as F
 
 
 # INFO: copy from last TP
-# we didn't use the train.py implementation to be simpler
+# we didn't use the train.py file to have simpler includes
 class GoValueNetwork(nn.Module):
     _BOARD = 8
     _CH = 6
@@ -241,7 +240,7 @@ class myPlayer(PlayerInterface):
     # ------------------------------------------------------------------
 
     def getPlayerName(self):
-        return "Kechna/Shrestha"
+        return "Kechna/Shrestha--Salie"
 
     def getPlayerMove(self):
         t0 = time.perf_counter()
