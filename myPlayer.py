@@ -21,6 +21,7 @@ import time
 import Goban
 from playerInterface import *
 
+
 _TT_EXACT = 0
 _TT_LOWER = 1
 _TT_UPPER = 2
@@ -52,7 +53,7 @@ class myPlayer(PlayerInterface):
         self._history = {}
 
     def getPlayerName(self):
-        return "Ing2 PVS 8x8"
+        return "Kechna/Shrestha"
 
     # ------------------------------------------------------------------
     # Board helpers
@@ -93,16 +94,16 @@ class myPlayer(PlayerInterface):
                 libs = self._board._stringLiberties[root]
                 if stone == opponent:
                     if libs == 1:
-                        score += 12.0   # capture opponent group
+                        score += 12.0  # capture opponent group
                     elif libs == 2:
-                        score += 6.0    # put opponent in atari
+                        score += 6.0  # put opponent in atari
                     else:
                         score += 3.0
                 else:  # same color
                     if libs == 1:
-                        score += 8.0    # save own group from capture
+                        score += 8.0  # save own group from capture
                     elif libs == 2:
-                        score += 2.5    # shore up nearly-threatened group
+                        score += 2.5  # shore up nearly-threatened group
                     else:
                         score += 2.0
 
@@ -184,10 +185,14 @@ class myPlayer(PlayerInterface):
         score_b, score_w = self._board.compute_score()
         if self._mycolor == Goban.Board._BLACK:
             score_term = float(score_b - score_w)
-            captures_term = float(self._board._capturedBLACK - self._board._capturedWHITE)
+            captures_term = float(
+                self._board._capturedBLACK - self._board._capturedWHITE
+            )
         else:
             score_term = float(score_w - score_b)
-            captures_term = float(self._board._capturedWHITE - self._board._capturedBLACK)
+            captures_term = float(
+                self._board._capturedWHITE - self._board._capturedBLACK
+            )
 
         board = self._board.get_board()
 
@@ -195,8 +200,8 @@ class myPlayer(PlayerInterface):
         analyzed_groups = set()
         lib_my = 0.0
         lib_opp = 0.0
-        atari_my = 0.0    # weighted size of MY groups in atari/near-atari
-        atari_opp = 0.0   # weighted size of OPPONENT groups in atari/near-atari
+        atari_my = 0.0  # weighted size of MY groups in atari/near-atari
+        atari_opp = 0.0  # weighted size of OPPONENT groups in atari/near-atari
 
         # --- Stone-level analysis ---
         infl_my = 0.0
@@ -239,13 +244,13 @@ class myPlayer(PlayerInterface):
             if p == self._mycolor:
                 lib_my += libs
                 if libs == 1:
-                    atari_my += size          # in atari: full penalty
+                    atari_my += size  # in atari: full penalty
                 elif libs == 2:
-                    atari_my += size * 0.35   # near-atari: soft penalty
+                    atari_my += size * 0.35  # near-atari: soft penalty
             else:
                 lib_opp += libs
                 if libs == 1:
-                    atari_opp += size         # opponent in atari: full reward
+                    atari_opp += size  # opponent in atari: full reward
                 elif libs == 2:
                     atari_opp += size * 0.35  # opponent near-atari: soft reward
 
@@ -260,19 +265,19 @@ class myPlayer(PlayerInterface):
                     eyes_opp += 1.0
 
         liberties_term = lib_my - lib_opp
-        atari_term = atari_opp - atari_my   # positive = good for us
+        atari_term = atari_opp - atari_my  # positive = good for us
         influence_term = infl_my - infl_opp
         center_term = center_my - center_opp
         eye_term = eyes_my - eyes_opp
 
         return (
-            2.0  * score_term
-            + 1.2  * captures_term
+            2.0 * score_term
+            + 1.2 * captures_term
             + 0.35 * liberties_term
-            + 3.5  * atari_term
-            + 0.2  * influence_term
+            + 3.5 * atari_term
+            + 0.2 * influence_term
             + 0.15 * center_term
-            + 1.5  * eye_term
+            + 1.5 * eye_term
         )
 
     # ------------------------------------------------------------------
