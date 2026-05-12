@@ -1,18 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Tournament player for 8x8 Go (Tromp-Taylor rules).
-
-Search:
-- Iterative deepening + PVS (Principal Variation Search / NegaScout)
-- Transposition table with EXACT / LOWER / UPPER bounds
-- Aspiration windows (narrows alpha-beta window using previous iteration result)
-- Killer moves (2 per depth) + history heuristic for move ordering
-- Adaptive max depth: deeper search when few empty cells remain
-
-Evaluation:
-- Group-level liberty analysis via union-find (_stringLiberties / _stringSizes)
-- Atari detection: heavy penalty/bonus for groups with 1 or 2 liberties
-- Eye counting: structural safety bonus
-- Territory score (compute_score), captures, influence, centre
+"""
+Implemented strategy Monte Carlo Tree Search
+Using previously trained model as heuristik
 """
 
 import math
@@ -22,13 +11,32 @@ import Goban
 from playerInterface import *
 
 
-_TT_EXACT = 0
-_TT_LOWER = 1
-_TT_UPPER = 2
-
-
 class _TimeOut(Exception):
     pass
+
+
+class _MCTSNode:
+    __slots__ = (
+        "parent",
+        "move",
+        "player",
+        "unexpanded",
+        "children",
+        "visits",
+        "value_sum",
+    )
+
+    def __init__(self, parent, move, player, moves):
+        self.parent = parent
+        self.move = move
+        self.player = player
+        self.unexpanded = list(moves)
+        self.children = {}
+        self.visits = 0
+        self.value_sum = 0.0
+
+    def mean_value(self):
+        return self.value_sum / self.visits if self.visits > 0 else 0.0
 
 
 class myPlayer(PlayerInterface):
@@ -37,366 +45,155 @@ class myPlayer(PlayerInterface):
         self._mycolor = None
         self._opponent = None
 
-        self._ttable = {}
+        # time control
         self._total_budget = 45.0 * 60.0
         self._used_time = 0.0
         self._safety_margin = 2.0
-
-        self._max_depth = 6
-        self._max_candidates = 18
-        self._root_move = -1
         self._deadline = 0.0
 
-        # killer_moves[depth] = [best_killer, second_killer]
-        self._killer_moves = {}
-        # history[move] = accumulated cutoff score
-        self._history = {}
+        # MCTS
+        self._c_uct = 1.30
 
     def getPlayerName(self):
         return "Kechna/Shrestha"
 
-    # ------------------------------------------------------------------
-    # Board helpers
-    # ------------------------------------------------------------------
+    def _candidate_moves(self):
+        return self._board.weak_legal_moves()
 
-    def _neighbors(self, flat_coord):
-        i = self._board._neighborsEntries[flat_coord]
-        while self._board._neighbors[i] != -1:
-            yield int(self._board._neighbors[i])
-            i += 1
-
-    def _has_neighbor_stone(self, move):
-        b = self._board.get_board()
-        for n in self._neighbors(move):
-            if b[n] != Goban.Board._EMPTY:
-                return True
-        return False
-
-    # ------------------------------------------------------------------
-    # Move ordering
-    # ------------------------------------------------------------------
-
-    def _quick_order_score(self, move, color):
-        """Heuristic score for a candidate move (higher = explore first)."""
-        if move == -1:
-            return -1000.0
-
-        b = self._board.get_board()
-        opponent = Goban.Board.flip(color)
-        score = 0.0
-
-        for n in self._neighbors(move):
-            stone = b[n]
-            if stone == Goban.Board._EMPTY:
-                score += 0.4
-            else:
-                root = self._board._getStringOfStone(n)
-                libs = self._board._stringLiberties[root]
-                if stone == opponent:
-                    if libs == 1:
-                        score += 12.0  # capture opponent group
-                    elif libs == 2:
-                        score += 6.0  # put opponent in atari
-                    else:
-                        score += 3.0
-                else:  # same color
-                    if libs == 1:
-                        score += 8.0  # save own group from capture
-                    elif libs == 2:
-                        score += 2.5  # shore up nearly-threatened group
-                    else:
-                        score += 2.0
-
-        x, y = Goban.Board.unflatten(move)
-        score -= 0.4 * (abs(x - 3.5) + abs(y - 3.5))
-        return score
-
-    def _ordered_moves(self, color, depth=0):
-        moves = self._board.weak_legal_moves()
-        non_pass = [m for m in moves if m != -1]
-
-        # Opening: prefer strong corner / near-centre points
-        if self._board._nbBLACK + self._board._nbWHITE == 0:
-            opening = [
-                Goban.Board.flatten((3, 3)),
-                Goban.Board.flatten((4, 4)),
-                Goban.Board.flatten((3, 4)),
-                Goban.Board.flatten((4, 3)),
-                Goban.Board.flatten((2, 2)),
-                Goban.Board.flatten((5, 5)),
-                Goban.Board.flatten((2, 5)),
-                Goban.Board.flatten((5, 2)),
-            ]
-            legal = set(non_pass)
-            ordered = [m for m in opening if m in legal]
-            ordered.extend(m for m in non_pass if m not in legal)
-            ordered.append(-1)
-            return ordered
-
-        # Killer moves bump to front
-        killers = self._killer_moves.get(depth, [None, None])
-        non_pass_set = set(non_pass)
-        killer_set = {k for k in killers if k is not None and k in non_pass_set}
-
-        adjacent = [m for m in non_pass if self._has_neighbor_stone(m)]
-        frontier = adjacent if adjacent else non_pass
-
-        hist = self._history
-        frontier.sort(
-            key=lambda m: (
-                (100.0 if m in killer_set else 0.0)
-                + self._quick_order_score(m, color)
-                + 0.01 * hist.get(m, 0)
-            ),
-            reverse=True,
-        )
-
-        if len(frontier) > self._max_candidates:
-            frontier = frontier[: self._max_candidates]
-
-        frontier.append(-1)
-        return frontier
-
-    # ------------------------------------------------------------------
-    # Evaluation
-    # ------------------------------------------------------------------
-
-    def _evaluate(self):
-        """
-        Sophisticated position evaluation.
-
-        Combines:
-        - Territory score (Chinese area scoring via compute_score)
-        - Captures
-        - Group-level liberty analysis (uses _stringLiberties / _stringSizes)
-        - Atari: heavy weight on groups with 1 liberty (in danger)
-        - Near-atari: moderate weight on groups with 2 liberties
-        - Eye count (structural safety)
-        - Influence and centre control
-        """
+    def _player_value(self, player):
         if self._board.is_game_over():
             winner = self._board.result_number()
-            if winner == self._mycolor:
-                return 10_000.0
-            if winner == self._opponent:
-                return -10_000.0
+            if winner == player:
+                return 1.0
+            if winner == Goban.Board.flip(player):
+                return -1.0
             return 0.0
 
-        score_b, score_w = self._board.compute_score()
-        if self._mycolor == Goban.Board._BLACK:
-            score_term = float(score_b - score_w)
-            captures_term = float(
-                self._board._capturedBLACK - self._board._capturedWHITE
-            )
-        else:
-            score_term = float(score_w - score_b)
-            captures_term = float(
-                self._board._capturedWHITE - self._board._capturedBLACK
-            )
-
-        board = self._board.get_board()
-
-        # --- Group-level analysis (one pass per group via union-find) ---
-        analyzed_groups = set()
-        lib_my = 0.0
-        lib_opp = 0.0
-        atari_my = 0.0  # weighted size of MY groups in atari/near-atari
-        atari_opp = 0.0  # weighted size of OPPONENT groups in atari/near-atari
-
-        # --- Stone-level analysis ---
-        infl_my = 0.0
-        infl_opp = 0.0
-        center_my = 0.0
-        center_opp = 0.0
-
-        for fc in range(len(board)):
-            p = board[fc]
-            if p == Goban.Board._EMPTY:
-                continue
-
-            # Stone-level: influence and centre
-            influence = 0.0
-            for n in self._neighbors(fc):
-                if board[n] == Goban.Board._EMPTY:
-                    influence += 1.0
-                elif board[n] == p:
-                    influence += 0.4
-
-            x, y = Goban.Board.unflatten(fc)
-            center_bonus = 3.5 - (abs(x - 3.5) + abs(y - 3.5)) * 0.5
-
-            if p == self._mycolor:
-                infl_my += influence
-                center_my += center_bonus
-            else:
-                infl_opp += influence
-                center_opp += center_bonus
-
-            # Group-level: only process each group root once
-            root = self._board._getStringOfStone(fc)
-            if root in analyzed_groups:
-                continue
-            analyzed_groups.add(root)
-
-            libs = self._board._stringLiberties[root]
-            size = self._board._stringSizes[root]
-
-            if p == self._mycolor:
-                lib_my += libs
-                if libs == 1:
-                    atari_my += size  # in atari: full penalty
-                elif libs == 2:
-                    atari_my += size * 0.35  # near-atari: soft penalty
-            else:
-                lib_opp += libs
-                if libs == 1:
-                    atari_opp += size  # opponent in atari: full reward
-                elif libs == 2:
-                    atari_opp += size * 0.35  # opponent near-atari: soft reward
-
-        # --- Eye counting ---
-        eyes_my = 0.0
-        eyes_opp = 0.0
-        for fc in range(len(board)):
-            if board[fc] == Goban.Board._EMPTY:
-                if self._board._is_an_eye(fc, self._mycolor):
-                    eyes_my += 1.0
-                elif self._board._is_an_eye(fc, self._opponent):
-                    eyes_opp += 1.0
-
-        liberties_term = lib_my - lib_opp
-        atari_term = atari_opp - atari_my  # positive = good for us
-        influence_term = infl_my - infl_opp
-        center_term = center_my - center_opp
-        eye_term = eyes_my - eyes_opp
-
-        return (
-            2.0 * score_term
-            + 1.2 * captures_term
-            + 0.35 * liberties_term
-            + 3.5 * atari_term
-            + 0.2 * influence_term
-            + 0.15 * center_term
-            + 1.5 * eye_term
-        )
-
-    # ------------------------------------------------------------------
-    # Search
-    # ------------------------------------------------------------------
+        return 0.0
 
     def _check_time(self):
         if time.perf_counter() >= self._deadline:
             raise _TimeOut()
 
-    def _negamax(self, depth, alpha, beta):
-        """PVS (Principal Variation Search) with transposition table."""
-        self._check_time()
+    def _select_child(self, node):
+        log_n = math.log(max(1, node.visits))
+        best_move = None
+        best_child = None
+        best_score = -math.inf
 
-        player_to_move = self._board.next_player()
-        sign = 1.0 if player_to_move == self._mycolor else -1.0
-
-        if depth == 0 or self._board.is_game_over():
-            return sign * self._evaluate()
-
-        # --- Transposition table lookup ---
-        key = (int(self._board._currentHash), depth, player_to_move)
-        cached = self._ttable.get(key)
-        if cached is not None:
-            tt_val, tt_flag = cached
-            if tt_flag == _TT_EXACT:
-                return tt_val
-            elif tt_flag == _TT_LOWER:
-                alpha = max(alpha, tt_val)
-            else:  # _TT_UPPER
-                beta = min(beta, tt_val)
-            if alpha >= beta:
-                return tt_val
-
-        orig_alpha = alpha
-        best = -math.inf
-        has_valid = False
-        first_move = True
-
-        for move in self._ordered_moves(player_to_move, depth):
-            ok = self._board.push(move)
-            if not ok:
-                self._board.pop()
-                continue
-            has_valid = True
-
-            try:
-                if first_move:
-                    # Full window on first (expected best) move
-                    value = -self._negamax(depth - 1, -beta, -alpha)
-                    first_move = False
-                else:
-                    # PVS: null-window search, re-search only if it might be better
-                    value = -self._negamax(depth - 1, -alpha - 1, -alpha)
-                    if alpha < value < beta:
-                        value = -self._negamax(depth - 1, -beta, -alpha)
-            finally:
-                self._board.pop()
-
-            if value > best:
-                best = value
-            if value > alpha:
-                alpha = value
-            if alpha >= beta:
-                # Beta cutoff — update killers and history
-                if move != -1:
-                    killers = self._killer_moves.setdefault(depth, [None, None])
-                    if killers[0] != move:
-                        killers[1] = killers[0]
-                        killers[0] = move
-                    self._history[move] = self._history.get(move, 0) + depth * depth
-                break
-
-        if not has_valid:
-            best = sign * self._evaluate()
-
-        # --- Store in transposition table ---
-        if best <= orig_alpha:
-            tt_flag = _TT_UPPER
-        elif best >= beta:
-            tt_flag = _TT_LOWER
-        else:
-            tt_flag = _TT_EXACT
-        self._ttable[key] = (best, tt_flag)
-
-        return best
-
-    def _search_root(self, depth, alpha=-math.inf, beta=math.inf):
-        """Root search with PVS. Returns (best_move, best_value)."""
-        color = self._board.next_player()
-        best_val = -math.inf
-        best_move = self._root_move
-        first_move = True
-
-        for move in self._ordered_moves(color, depth):
-            self._check_time()
-            ok = self._board.push(move)
-            if not ok:
-                self._board.pop()
-                continue
-
-            try:
-                if first_move:
-                    value = -self._negamax(depth - 1, -beta, -alpha)
-                    first_move = False
-                else:
-                    value = -self._negamax(depth - 1, -alpha - 1, -alpha)
-                    if alpha < value < beta:
-                        value = -self._negamax(depth - 1, -beta, -alpha)
-            finally:
-                self._board.pop()
-
-            if value > best_val:
-                best_val = value
+        for move, child in node.children.items():
+            q_child = child.mean_value()
+            action_q = -q_child
+            u = self._c_uct * math.sqrt(log_n / (1.0 + child.visits))
+            score = action_q + u
+            if score > best_score:
+                best_score = score
                 best_move = move
-            if value > alpha:
-                alpha = value
+                best_child = child
 
-        return best_move, best_val
+        return best_move, best_child
+
+    def _expand_one(self, node):
+        """Expand one untried move"""
+        while node.unexpanded:
+            move = node.unexpanded.pop(0)
+            ok = self._board.push(move)
+            if not ok:
+                self._board.pop()
+                continue
+
+            next_player = self._board.next_player()
+            next_moves = self._candidate_moves()
+            child = _MCTSNode(
+                parent=node,
+                move=move,
+                player=next_player,
+                moves=next_moves,
+            )
+            node.children[move] = child
+            return child
+
+        return None
+
+    def _backpropagate(self, path, value):
+        for node in reversed(path):
+            node.visits += 1
+            node.value_sum += value
+            value = -value
+
+    def _mcts_search(self, fallback_move):
+        root_player = self._board.next_player()
+        root_moves = self._candidate_moves()
+        root = _MCTSNode(
+            parent=None,
+            move=None,
+            player=root_player,
+            moves=root_moves,
+        )
+
+        simulations = 0
+        while True:
+            self._check_time()
+            simulations += 1
+
+            node = root
+            path = [node]
+            pushed = 0
+
+            # Selection
+            while (
+                not node.unexpanded and node.children and not self._board.is_game_over()
+            ):
+                move, child = self._select_child(node)
+                if child is None:
+                    break
+                ok = self._board.push(move)
+                if not ok:
+                    self._board.pop()
+                    del node.children[move]
+                    continue
+                pushed += 1
+                node = child
+                path.append(node)
+
+            # Expansion
+            if not self._board.is_game_over():
+                child = self._expand_one(node)
+                if child is not None:
+                    pushed += 1
+                    node = child
+                    path.append(node)
+
+            # Evaluation
+            leaf_value = self._player_value(node.player)
+            self._backpropagate(path, leaf_value)
+
+            for _ in range(pushed):
+                self._board.pop()
+
+        # Normally unreachable ?
+        return fallback_move, 0.0, simulations, root
+
+    def _best_move_from_root(self, root, fallback_move):
+        if not root.children:
+            return fallback_move, 0.0, 0
+
+        best_move = fallback_move
+        best_visits = -1
+        best_q = -math.inf
+        total_visits = 0
+
+        for move, child in root.children.items():
+            total_visits += child.visits
+            action_q = -child.mean_value()
+            if child.visits > best_visits or (
+                child.visits == best_visits and action_q > best_q
+            ):
+                best_visits = child.visits
+                best_q = action_q
+                best_move = move
+
+        return best_move, best_q, total_visits
 
     # ------------------------------------------------------------------
     # Time management
@@ -414,15 +211,15 @@ class myPlayer(PlayerInterface):
         if empties > 42:
             factor = 0.9
         elif empties > 22:
-            factor = 1.3
+            factor = 1.25
         else:
-            factor = 1.8
+            factor = 1.7
 
         budget = base * factor
         return max(0.05, min(10.0, budget, 0.25 * remaining))
 
     # ------------------------------------------------------------------
-    # PlayerInterface implementation
+    #
     # ------------------------------------------------------------------
 
     def getPlayerMove(self):
@@ -437,60 +234,73 @@ class myPlayer(PlayerInterface):
                 self._board.push(only)
                 return Goban.Board.flat_to_name(only)
 
-            # Default fallback in case search is interrupted immediately
-            self._root_move = next((m for m in legal if m != -1), legal[0])
-
-            self._ttable.clear()
-            self._killer_moves.clear()
-            self._history.clear()
+            fallback_move = next((m for m in legal if m != -1), -1)
 
             turn_budget = self._allocate_turn_budget()
             self._deadline = time.perf_counter() + turn_budget
 
-            # Deeper endgame search when branching factor is small
-            empties = len(self._board._empties)
-            if empties <= 8:
-                max_d = 12
-            elif empties <= 15:
-                max_d = 9
-            else:
-                max_d = self._max_depth
+            root_player = self._board.next_player()
+            root_moves = self._candidate_moves()
+            root = _MCTSNode(
+                parent=None,
+                move=None,
+                player=root_player,
+                moves=root_moves,
+            )
 
-            best_move = self._root_move
-            best_val = -math.inf
-            reached_depth = 0
+            simulations = 0
+            try:
+                while True:
+                    self._check_time()
+                    simulations += 1
 
-            for depth in range(1, max_d + 1):
-                try:
-                    if reached_depth >= 2 and abs(best_val) < 9_000.0:
-                        # Aspiration window: narrow search around previous result
-                        window = 1.5
-                        lo, hi = best_val - window, best_val + window
-                        candidate, value = self._search_root(depth, lo, hi)
-                        if value <= lo or value >= hi:
-                            # Window failed — full re-search at this depth
-                            candidate, value = self._search_root(depth)
-                    else:
-                        candidate, value = self._search_root(depth)
-                except _TimeOut:
-                    break
+                    node = root
+                    path = [node]
+                    pushed = 0
 
-                if candidate is not None:
-                    best_move = candidate
-                    best_val = value
-                    reached_depth = depth
+                    while (
+                        not node.unexpanded
+                        and node.children
+                        and not self._board.is_game_over()
+                    ):
+                        move, child = self._select_child(node)
+                        if child is None:
+                            break
+                        ok = self._board.push(move)
+                        if not ok:
+                            self._board.pop()
+                            del node.children[move]
+                            continue
+                        pushed += 1
+                        node = child
+                        path.append(node)
 
-                # Stop early if we found a forced win/loss
-                if abs(best_val) >= 9_000.0:
-                    break
+                    if not self._board.is_game_over():
+                        child = self._expand_one(node)
+                        if child is not None:
+                            pushed += 1
+                            node = child
+                            path.append(node)
 
+                    leaf_value = self._player_value(node.player)
+                    self._backpropagate(path, leaf_value)
+
+                    for _ in range(pushed):
+                        self._board.pop()
+            except _TimeOut:
+                pass
+
+            best_move, best_q, root_visits = self._best_move_from_root(
+                root, fallback_move
+            )
             if best_move not in legal:
-                best_move = self._root_move
+                best_move = fallback_move if fallback_move in legal else legal[0]
 
             self._board.push(best_move)
             print(
                 f"[{self.getPlayerName()}] move={Goban.Board.flat_to_name(best_move)} "
-                f"depth={reached_depth} eval={best_val:.2f} budget={turn_budget:.2f}s"
+                f"sims={simulations} rootN={root_visits} q={best_q:.3f} "
+                f"budget={turn_budget:.2f}s"
             )
             return Goban.Board.flat_to_name(best_move)
         finally:
@@ -503,9 +313,6 @@ class myPlayer(PlayerInterface):
         self._board = Goban.Board()
         self._mycolor = color
         self._opponent = Goban.Board.flip(color)
-        self._ttable.clear()
-        self._killer_moves.clear()
-        self._history.clear()
 
     def endGame(self, winner):
         if self._mycolor == winner:

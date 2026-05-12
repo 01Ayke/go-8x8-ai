@@ -5,9 +5,21 @@ Binome
 ------
 Aymane Kechna,Pierre-Louis Shrestha--Salie
 
+Introduction
+------------
+Nous avons développer deux players différents, myPlayer et fullPerf.
 
 
 Techniques utilisees dans l'IA (`myPlayer.py`)
+----------------------------------------------
+Nous avons utilisé la technique de MCTS, avec UCT comme formule de choix de noeud. 
+Nous utilisant le modèle développer lors du dernier tp comme heuristique.
+La gestion du temps fonctionne selon l'algorithme suivant:
+Un "budget" est alloué par coup selon la phase de jeu(nombre de cases vides) ainsi que le temps total restant.
+Un contrôle est également effectué dans la boucle de recherche MCTS. Si le temps alloué est dépassé,
+le meilleur coup trouvé est alors joué.
+
+Techniques utilisees dans l'IA (`fullPerf.py`)
 ----------------------------------------------
 1. Recherche Negamax alpha-beta avec approfondissement iteratif.
    - On lance des recherches de profondeur 1, puis 2, puis 3, etc.
