@@ -8,6 +8,8 @@ Aymane Kechna,Pierre-Louis Shrestha--Salie
 Introduction
 ------------
 Nous avons développer deux players différents, myPlayer et fullPerf.
+fullPerf correspond a un joueur qui, dans une recherche de peformances maximale, a été concu avec l'utilisation d'LLM. Ce joueur correspond donc a une version expérimentale.
+myPlayer correspond au rendu de notre travail avant la création, et donc de l'utilisation de LLM.
 
 
 Techniques utilisees dans l'IA (`myPlayer.py`)
@@ -15,7 +17,7 @@ Techniques utilisees dans l'IA (`myPlayer.py`)
 Nous avons utilisé la technique de MCTS, avec UCT comme formule de choix de noeud. 
 Nous utilisant le modèle développer lors du dernier tp comme heuristique.
 La gestion du temps fonctionne selon l'algorithme suivant:
-Un "budget" est alloué par coup selon la phase de jeu(nombre de cases vides) ainsi que le temps total restant.
+Un "budget" est alloué par coup selon la phase de jeu (nombre de cases vides) ainsi que le temps total restant.
 Un contrôle est également effectué dans la boucle de recherche MCTS. Si le temps alloué est dépassé,
 le meilleur coup trouvé est alors joué.
 

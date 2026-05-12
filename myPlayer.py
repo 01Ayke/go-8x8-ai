@@ -5,10 +5,18 @@ Using previously trained model as heuristik
 """
 
 import math
+import os
+import random
 import time
+from train import GoValueNetwork
 
 import Goban
 from playerInterface import *
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 class _TimeOut(Exception):
@@ -53,12 +61,67 @@ class myPlayer(PlayerInterface):
 
         # MCTS
         self._c_uct = 1.30
+        self._value_model = None
+        self._init_value_model()
 
     def getPlayerName(self):
         return "Kechna/Shrestha"
 
+    def _neighbors(self, flat_coord):
+        i = self._board._neighborsEntries[flat_coord]
+        while self._board._neighbors[i] != -1:
+            yield int(self._board._neighbors[i])
+            i += 1
+
     def _candidate_moves(self):
-        return self._board.weak_legal_moves()
+        moves = self._board.weak_legal_moves()
+        non_pass = [m for m in moves if m != -1]
+        random.shuffle(non_pass)
+        if -1 in moves:
+            non_pass.append(-1)
+        return non_pass
+
+    def _init_value_model(self):
+        model_path = os.path.join(os.path.dirname(__file__), "go_cnn_6_canaux_best.pt")
+        model = GoValueNetwork()
+        state = torch.load(model_path, map_location="cpu")
+        model.load_state_dict(state)
+        model.eval()
+        self._value_model = model
+
+    def _board_to_planes(self, to_play):
+        # Must match train.py encoding:
+        # 0 white, 1 black, 2 turn(1 if black to play), 3 empty,
+        # 4 empty-neighbor-of-black, 5 empty-neighbor-of-white.
+        board = self._board.get_board()
+        planes = np.zeros((6, 8, 8), dtype=np.float32)
+
+        for fc, p in enumerate(board):
+            x, y = Goban.Board.unflatten(fc)
+            if p == Goban.Board._WHITE:
+                planes[0, y, x] = 1.0
+            elif p == Goban.Board._BLACK:
+                planes[1, y, x] = 1.0
+
+        if to_play == Goban.Board._BLACK:
+            planes[2, :, :] = 1.0
+
+        occupied = (planes[0] == 1.0) | (planes[1] == 1.0)
+        planes[3] = (~occupied).astype(np.float32)
+
+        for fc, p in enumerate(board):
+            if p not in (Goban.Board._BLACK, Goban.Board._WHITE):
+                continue
+            x, y = Goban.Board.unflatten(fc)
+            for n in self._neighbors(fc):
+                nx, ny = Goban.Board.unflatten(n)
+                if planes[3, ny, nx] != 1.0:
+                    continue
+                if p == Goban.Board._BLACK:
+                    planes[4, ny, nx] = 1.0
+                else:
+                    planes[5, ny, nx] = 1.0
+        return planes
 
     def _player_value(self, player):
         if self._board.is_game_over():
@@ -69,7 +132,12 @@ class myPlayer(PlayerInterface):
                 return -1.0
             return 0.0
 
-        return 0.0
+        planes = self._board_to_planes(player)
+        x = torch.from_numpy(planes).unsqueeze(0)
+        with torch.no_grad():
+            # Model output interpreted as P(win for player-to-move).
+            p = float(self._value_model(x).item())
+        return 2.0 * p - 1.0
 
     def _check_time(self):
         if time.perf_counter() >= self._deadline:
@@ -81,7 +149,9 @@ class myPlayer(PlayerInterface):
         best_child = None
         best_score = -math.inf
 
-        for move, child in node.children.items():
+        items = list(node.children.items())
+        random.shuffle(items)
+        for move, child in items:
             q_child = child.mean_value()
             action_q = -q_child
             u = self._c_uct * math.sqrt(log_n / (1.0 + child.visits))
@@ -121,7 +191,7 @@ class myPlayer(PlayerInterface):
             node.value_sum += value
             value = -value
 
-    def _mcts_search(self, fallback_move):
+    def _mcts_search(self, default_move):
         root_player = self._board.next_player()
         root_moves = self._candidate_moves()
         root = _MCTSNode(
@@ -172,13 +242,13 @@ class myPlayer(PlayerInterface):
                 self._board.pop()
 
         # Normally unreachable ?
-        return fallback_move, 0.0, simulations, root
+        return default_move, 0.0, simulations, root
 
-    def _best_move_from_root(self, root, fallback_move):
+    def _best_move_from_root(self, root, default_move):
         if not root.children:
-            return fallback_move, 0.0, 0
+            return default_move, 0.0, 0
 
-        best_move = fallback_move
+        best_move = default_move
         best_visits = -1
         best_q = -math.inf
         total_visits = 0
@@ -211,12 +281,12 @@ class myPlayer(PlayerInterface):
         if empties > 42:
             factor = 0.9
         elif empties > 22:
-            factor = 1.25
+            factor = 1.6
         else:
-            factor = 1.7
+            factor = 2.2
 
         budget = base * factor
-        return max(0.05, min(10.0, budget, 0.25 * remaining))
+        return max(0.05, min(14, budget, 0.35 * remaining))
 
     # ------------------------------------------------------------------
     #
@@ -234,7 +304,9 @@ class myPlayer(PlayerInterface):
                 self._board.push(only)
                 return Goban.Board.flat_to_name(only)
 
-            fallback_move = next((m for m in legal if m != -1), -1)
+            # Move kept as fallback before MCTS gathers enough statistics.
+            non_pass = [m for m in legal if m != -1]
+            default_move = random.choice(non_pass) if non_pass else -1
 
             turn_budget = self._allocate_turn_budget()
             self._deadline = time.perf_counter() + turn_budget
@@ -249,6 +321,9 @@ class myPlayer(PlayerInterface):
             )
 
             simulations = 0
+            best_move = default_move
+            best_q = 0.0
+            root_visits = 0
             try:
                 while True:
                     self._check_time()
@@ -284,17 +359,19 @@ class myPlayer(PlayerInterface):
 
                     leaf_value = self._player_value(node.player)
                     self._backpropagate(path, leaf_value)
+                    best_move, best_q, root_visits = self._best_move_from_root(
+                        root, default_move
+                    )
 
                     for _ in range(pushed):
                         self._board.pop()
             except _TimeOut:
                 pass
 
-            best_move, best_q, root_visits = self._best_move_from_root(
-                root, fallback_move
-            )
+            # Final read of the best move found so far at timeout.
+            best_move, best_q, root_visits = self._best_move_from_root(root, best_move)
             if best_move not in legal:
-                best_move = fallback_move if fallback_move in legal else legal[0]
+                best_move = default_move if default_move in legal else legal[0]
 
             self._board.push(best_move)
             print(
