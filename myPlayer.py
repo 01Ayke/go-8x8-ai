@@ -84,7 +84,7 @@ class myPlayer(PlayerInterface):
         self._c_uct = 1.30
 
         # time
-        self._total_budget = 45.0 * 60.0
+        self._total_budget = 45.0 * 60.0 #45 minutes is how much time the game lasts
         self._used_time = 0.0
         self._safety_margin = 2.0
         self._deadline = 0.0
@@ -222,11 +222,12 @@ class myPlayer(PlayerInterface):
         return best_move, best_q, total
 
     def _check_time(self):
+        #if we take too much time , timeout
         if time.perf_counter() >= self._deadline:
             raise _TimeOut()
 
     # ------------------------------------------------------------------
-
+    #calculate the budget allocated for a play with reagrds to the time that he has left
     def _turn_budget(self):
         remaining = self._total_budget - self._used_time - self._safety_margin
         if remaining <= 0.1:
@@ -255,7 +256,7 @@ class myPlayer(PlayerInterface):
 
             non_pass = [m for m in legal if m != -1]
             fallback = random.choice(non_pass) if non_pass else -1
-
+            #time management
             budget = self._turn_budget()
             self._deadline = time.perf_counter() + budget
 
